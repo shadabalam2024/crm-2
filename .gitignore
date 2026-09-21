@@ -17,3 +17,5 @@ tools/private-key.pem
 
 # local Claude Code session/scheduler state, not project source
 .claude/
+.vercel
+.env*
