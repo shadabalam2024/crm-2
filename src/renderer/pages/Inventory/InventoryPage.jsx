@@ -1,10 +1,18 @@
 import { useState, useEffect, useRef } from 'react'
 import Navbar from '../../components/Navbar'
 import Sidebar from '../../components/Sidebar'
+import EmptyState from '../../components/EmptyState'
+import { TableSkeleton } from '../../components/Skeleton'
+import { supabase } from '../../lib/supabaseClient'
 
 const emptyForm = {
   name: '', sku: '', barcode: '', category_id: '',
   cost_price: '', selling_price: '', current_stock: '', min_stock_level: '5'
+}
+
+const csvEscape = (value) => {
+  const str = String(value ?? '')
+  return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str
 }
 
 export default function InventoryPage() {
@@ -24,11 +32,14 @@ export default function InventoryPage() {
   const [exportError, setExportError] = useState(false)
   const [viewingHistoryFor, setViewingHistoryFor] = useState(null)
   const [priceHistory, setPriceHistory] = useState(null)
+  const [loading, setLoading] = useState(true)
   const barcodeInputRef = useRef(null)
 
   useEffect(() => {
-    loadProducts()
-    loadCategories()
+    (async () => {
+      await Promise.all([loadProducts(), loadCategories()])
+      setLoading(false)
+    })()
   }, [])
 
   useEffect(() => {
@@ -42,33 +53,73 @@ export default function InventoryPage() {
     if (e.key === 'Enter') e.preventDefault()
   }
 
-  const handleExportCsv = async () => {
+  const handleExportCsv = () => {
     setExportMessage('')
-    const result = await window.ipcRenderer.invoke('export-inventory-excel')
-    if (result.success) {
-      setExportError(false)
-      setExportMessage(`Exported to ${result.filePath}`)
-      setTimeout(() => setExportMessage(''), 5000)
-    } else if (!result.canceled) {
+
+    if (products.length === 0) {
       setExportError(true)
-      setExportMessage(result.message || 'Export failed')
+      setExportMessage('No products to export')
+      return
     }
+
+    const categoryName = (id) => categories.find(c => c.id === id)?.name || ''
+    const header = ['Name', 'SKU', 'Barcode', 'Category', 'Cost Price', 'Selling Price', 'Current Stock', 'Min Stock Level']
+    const rows = products.map(p => [
+      p.name, p.sku, p.barcode, categoryName(p.category_id),
+      p.cost_price, p.selling_price, p.current_stock, p.min_stock_level,
+    ])
+    const csv = [header, ...rows].map(row => row.map(csvEscape).join(',')).join('\n')
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `inventory-${new Date().toISOString().slice(0, 10)}.csv`
+    link.click()
+    URL.revokeObjectURL(url)
+
+    setExportError(false)
+    setExportMessage('Exported inventory.csv')
+    setTimeout(() => setExportMessage(''), 5000)
   }
 
   const openPriceHistory = async (product) => {
     setViewingHistoryFor(product)
-    const history = await window.ipcRenderer.invoke('get-cost-price-history', product.id)
-    setPriceHistory(history)
+    const { data: history } = await supabase
+      .from('price_history')
+      .select('*')
+      .eq('product_id', product.id)
+      .order('created_at', { ascending: false })
+
+    setPriceHistory(history || [])
   }
 
   const loadProducts = async () => {
-    const data = await window.ipcRenderer.invoke('get-products')
-    setProducts(data)
+    const { data, error } = await supabase
+      .from('products')
+      .select('*')
+      .order('created_at', { ascending: false })
+
+    if (error) {
+      setProducts([])
+      return
+    }
+
+    setProducts(data || [])
   }
 
   const loadCategories = async () => {
-    const data = await window.ipcRenderer.invoke('get-categories')
-    setCategories(data)
+    const { data, error } = await supabase
+      .from('categories')
+      .select('*')
+      .order('name', { ascending: true })
+
+    if (error) {
+      setCategories([])
+      return
+    }
+
+    setCategories(data || [])
   }
 
   const openAddForm = () => {
@@ -96,14 +147,35 @@ export default function InventoryPage() {
 
   const handleAddCategory = async () => {
     if (!newCategory.trim()) return
-    const result = await window.ipcRenderer.invoke('add-category', newCategory.trim())
-    if (result.success) {
-      await loadCategories()
-      setForm(f => ({ ...f, category_id: result.categoryId }))
+
+    const trimmed = newCategory.trim()
+
+    const { data: existing, error: existingError } = await supabase
+      .from('categories')
+      .select('*')
+      .ilike('name', trimmed)
+      .maybeSingle()
+
+    if ((existing || existingError) && existing?.id) {
+      setForm(f => ({ ...f, category_id: existing.id }))
       setNewCategory('')
-    } else {
-      setError(result.message)
+      return
     }
+
+    const { data, error } = await supabase
+      .from('categories')
+      .insert([{ name: trimmed }])
+      .select()
+      .single()
+
+    if (error) {
+      setError(error.message || 'Failed to add category')
+      return
+    }
+
+    await loadCategories()
+    setForm(f => ({ ...f, category_id: data.id }))
+    setNewCategory('')
   }
 
   const handleSubmit = async (e) => {
@@ -121,26 +193,45 @@ export default function InventoryPage() {
       min_stock_level: parseInt(form.min_stock_level) || 5
     }
 
-    const result = editingId
-      ? await window.ipcRenderer.invoke('update-product', { id: editingId, ...payload })
-      : await window.ipcRenderer.invoke('add-product', payload)
+    if (editingId) {
+      const { error } = await supabase
+        .from('products')
+        .update(payload)
+        .eq('id', editingId)
 
-    if (result.success) {
-      setShowForm(false)
-      loadProducts()
+      if (error) {
+        setError(error.message || 'Failed to save product')
+        return
+      }
     } else {
-      setError(result.message || 'Failed to save product')
+      const { error } = await supabase
+        .from('products')
+        .insert([{ ...payload, created_at: new Date().toISOString() }])
+
+      if (error) {
+        setError(error.message || 'Failed to save product')
+        return
+      }
     }
+
+    setShowForm(false)
+    loadProducts()
   }
 
   const handleDelete = async (product) => {
     if (!confirm(`Delete "${product.name}"? This cannot be undone.`)) return
-    const result = await window.ipcRenderer.invoke('delete-product', product.id)
-    if (result.success) {
-      loadProducts()
-    } else {
-      alert(result.message || 'Failed to delete product')
+
+    const { error } = await supabase
+      .from('products')
+      .delete()
+      .eq('id', product.id)
+
+    if (error) {
+      alert(error.message || 'Failed to delete product')
+      return
     }
+
+    loadProducts()
   }
 
   const openAdjustStock = (product) => {
@@ -151,17 +242,19 @@ export default function InventoryPage() {
 
   const handleAdjustStock = async (e) => {
     e.preventDefault()
-    const result = await window.ipcRenderer.invoke('adjust-stock', {
-      productId: adjustingProduct.id,
-      newStock: parseInt(adjustStock) || 0,
-      reason: adjustReason
-    })
-    if (result.success) {
-      setAdjustingProduct(null)
-      loadProducts()
-    } else {
-      alert(result.message || 'Failed to adjust stock')
+
+    const { error } = await supabase
+      .from('products')
+      .update({ current_stock: parseInt(adjustStock) || 0 })
+      .eq('id', adjustingProduct.id)
+
+    if (error) {
+      alert(error.message || 'Failed to adjust stock')
+      return
     }
+
+    setAdjustingProduct(null)
+    loadProducts()
   }
 
   const SORT_OPTIONS = {
@@ -194,10 +287,10 @@ export default function InventoryPage() {
       <Sidebar />
       <div className="flex-1">
         <Navbar />
-        <div className="p-8">
-          <div className="flex justify-between items-center mb-6">
+        <div className="p-4 sm:p-8">
+          <div className="flex flex-wrap justify-between items-center gap-3 mb-6">
             <h1 className="text-3xl font-bold">Inventory</h1>
-            <div className="flex gap-3">
+            <div className="flex flex-wrap gap-3">
               <button
                 onClick={handleExportCsv}
                 className="border border-gray-300 px-4 py-2 rounded hover:bg-gray-50"
@@ -214,8 +307,8 @@ export default function InventoryPage() {
           </div>
           {exportMessage && <p className={`text-sm mb-4 ${exportError ? 'text-red-600' : 'text-green-600'}`}>{exportMessage}</p>}
 
-          <div className="flex gap-4 mb-4">
-            <div className="flex-1 max-w-sm">
+          <div className="flex flex-wrap gap-4 mb-4">
+            <div className="flex-1 min-w-[180px] max-w-sm">
               <label className="block text-xs text-gray-500 mb-1">Search</label>
               <input
                 type="text"
@@ -240,6 +333,7 @@ export default function InventoryPage() {
           </div>
 
           <div className="bg-white rounded-lg shadow overflow-hidden">
+            <div className="overflow-x-auto">
             <table className="w-full">
               <thead className="bg-gray-100 border-b">
                 <tr>
@@ -252,42 +346,51 @@ export default function InventoryPage() {
                   <th className="px-6 py-3 text-right">Actions</th>
                 </tr>
               </thead>
-              <tbody>
-                {filteredProducts.map(p => (
-                  <tr key={p.id} className={`border-b hover:bg-gray-50 ${p.current_stock <= p.min_stock_level ? 'bg-orange-50' : ''}`}>
-                    <td className="px-6 py-4">{p.name}</td>
-                    <td className="px-6 py-4 text-gray-500">{p.sku}</td>
-                    <td className="px-6 py-4 text-gray-500">{p.category_name || '-'}</td>
-                    <td className={`px-6 py-4 text-right ${p.current_stock <= p.min_stock_level ? 'text-orange-600 font-bold' : ''}`}>
-                      {p.current_stock}
-                    </td>
-                    <td className="px-6 py-4 text-right">
-                      <button onClick={() => openPriceHistory(p)} className="text-blue-600 hover:underline">
-                        ₹{p.cost_price}
-                      </button>
-                    </td>
-                    <td className="px-6 py-4 text-right">₹{p.selling_price}</td>
-                    <td className="px-6 py-4 text-right space-x-3 whitespace-nowrap">
-                      <button onClick={() => openAdjustStock(p)} className="text-blue-600 hover:underline">Stock</button>
-                      <button onClick={() => openEditForm(p)} className="text-blue-600 hover:underline">Edit</button>
-                      <button onClick={() => handleDelete(p)} className="text-red-600 hover:underline">Delete</button>
-                    </td>
-                  </tr>
-                ))}
-                {filteredProducts.length === 0 && (
-                  <tr><td colSpan="7" className="py-8 text-center text-gray-400">
-                    {search.trim() ? 'No products match your search' : 'No products yet'}
-                  </td></tr>
-                )}
-              </tbody>
+              {loading ? (
+                <TableSkeleton rows={8} cols={7} />
+              ) : (
+                <tbody>
+                  {filteredProducts.map(p => (
+                    <tr key={p.id} className={`row-in border-b hover:bg-gray-50 ${p.current_stock <= p.min_stock_level ? 'bg-orange-50' : ''}`}>
+                      <td className="px-6 py-4">{p.name}</td>
+                      <td className="px-6 py-4 text-gray-500">{p.sku}</td>
+                      <td className="px-6 py-4 text-gray-500">{p.category_name || '-'}</td>
+                      <td className={`px-6 py-4 text-right ${p.current_stock <= p.min_stock_level ? 'text-orange-600 font-bold' : ''}`}>
+                        {p.current_stock}
+                      </td>
+                      <td className="px-6 py-4 text-right">
+                        <button onClick={() => openPriceHistory(p)} className="text-blue-600 hover:underline">
+                          ₹{p.cost_price}
+                        </button>
+                      </td>
+                      <td className="px-6 py-4 text-right">₹{p.selling_price}</td>
+                      <td className="px-6 py-4 text-right space-x-3 whitespace-nowrap">
+                        <button onClick={() => openAdjustStock(p)} className="text-blue-600 hover:underline">Stock</button>
+                        <button onClick={() => openEditForm(p)} className="text-blue-600 hover:underline">Edit</button>
+                        <button onClick={() => handleDelete(p)} className="text-red-600 hover:underline">Delete</button>
+                      </td>
+                    </tr>
+                  ))}
+                  {filteredProducts.length === 0 && (
+                    <tr><td colSpan="7">
+                      {search.trim() ? (
+                        <EmptyState title="No products match your search" message="Try a different name, SKU, or barcode." />
+                      ) : (
+                        <EmptyState title="No products yet" message="Add your first product to start tracking inventory." actionLabel="+ Add Product" onAction={openAddForm} />
+                      )}
+                    </td></tr>
+                  )}
+                </tbody>
+              )}
             </table>
+            </div>
           </div>
         </div>
       </div>
 
       {showForm && (
-        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-20">
-          <div className="bg-white rounded-lg shadow-lg p-6 w-full max-w-md max-h-[90vh] overflow-y-auto">
+        <div className="overlay-in fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-20">
+          <div className="panel-in bg-white rounded-lg shadow-lg p-6 w-full max-w-md max-h-[90vh] overflow-y-auto">
             <h2 className="text-xl font-bold mb-4">{editingId ? 'Edit Product' : 'Add Product'}</h2>
             <form onSubmit={handleSubmit}>
               <label className="block text-xs text-gray-500 mb-1">Product Name</label>
@@ -296,7 +399,7 @@ export default function InventoryPage() {
                 value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })}
                 className="w-full px-4 py-2 border rounded mb-3"
               />
-              <div className="grid grid-cols-2 gap-3 mb-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
                 <div>
                   <label className="block text-xs text-gray-500 mb-1">SKU</label>
                   <input
@@ -358,7 +461,7 @@ export default function InventoryPage() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-3 mb-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
                 <div>
                   <label className="block text-xs text-gray-500 mb-1">Cost Price</label>
                   <input
@@ -377,7 +480,7 @@ export default function InventoryPage() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-3 mb-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
                 <div>
                   <label className="block text-xs text-gray-500 mb-1">
                     {editingId ? 'Current Stock (use "Stock" action to adjust)' : 'Opening Stock'}
@@ -420,8 +523,8 @@ export default function InventoryPage() {
       )}
 
       {adjustingProduct && (
-        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-20">
-          <div className="bg-white rounded-lg shadow-lg p-6 w-full max-w-sm">
+        <div className="overlay-in fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-20">
+          <div className="panel-in bg-white rounded-lg shadow-lg p-6 w-full max-w-sm">
             <h2 className="text-xl font-bold mb-1">Adjust Stock</h2>
             <p className="text-sm text-gray-500 mb-4">{adjustingProduct.name}</p>
             <form onSubmit={handleAdjustStock}>
@@ -451,8 +554,8 @@ export default function InventoryPage() {
       )}
 
       {viewingHistoryFor && (
-        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-20">
-          <div className="bg-white rounded-lg shadow-lg p-6 w-full max-w-4xl max-h-[80vh] overflow-y-auto">
+        <div className="overlay-in fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-20">
+          <div className="panel-in bg-white rounded-lg shadow-lg p-6 w-full max-w-4xl max-h-[80vh] overflow-y-auto">
             <div className="flex justify-between items-start mb-4">
               <div>
                 <h2 className="text-xl font-bold">Price History</h2>
@@ -460,9 +563,11 @@ export default function InventoryPage() {
               </div>
               <button onClick={() => { setViewingHistoryFor(null); setPriceHistory(null) }} className="text-gray-400 hover:text-gray-700">✕</button>
             </div>
-            {!priceHistory && <p className="text-gray-400">Loading...</p>}
+            {!priceHistory && (
+              <table className="w-full text-sm"><TableSkeleton rows={4} cols={6} /></table>
+            )}
             {priceHistory && priceHistory.length === 0 && (
-              <p className="text-gray-400">No price changes recorded yet - current cost was set when the product was created.</p>
+              <EmptyState title="No price changes yet" message="Current cost was set when the product was created." />
             )}
             {priceHistory && priceHistory.length > 0 && (
               <div className="overflow-x-auto">
@@ -485,7 +590,7 @@ export default function InventoryPage() {
                     const increased = hasOld && diff > 0
                     const decreased = hasOld && diff < 0
                     return (
-                      <tr key={h.id} className="border-b align-top">
+                      <tr key={h.id} className="row-in border-b align-top">
                         <td className="py-3 px-3 whitespace-nowrap">{new Date(h.changed_at).toLocaleString()}</td>
                         <td className="py-3 px-3 text-gray-500">
                           {h.source === 'purchase' ? `Purchase${h.supplier_name ? ` (${h.supplier_name})` : ''}` : 'Manual edit'}

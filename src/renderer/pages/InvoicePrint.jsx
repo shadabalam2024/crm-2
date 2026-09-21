@@ -1,46 +1,30 @@
 import { useState, useEffect } from 'react'
+import { useParams } from 'react-router-dom'
+import { supabase } from '../lib/supabaseClient'
 
-export default function InvoicePrint({ invoiceId }) {
+export default function InvoicePrint() {
+  const { invoiceId } = useParams()
   const [invoice, setInvoice] = useState(null)
   const [shop, setShop] = useState({})
-  const [logoUrl, setLogoUrl] = useState(null)
-  const [thermalStatus, setThermalStatus] = useState(null) // null | 'printing' | 'success' | 'error'
-  const [thermalError, setThermalError] = useState('')
 
   useEffect(() => {
     const load = async () => {
-      const [inv, shopSettings, logo] = await Promise.all([
-        window.ipcRenderer.invoke('get-invoice', invoiceId),
-        window.ipcRenderer.invoke('get-shop-settings'),
-        window.ipcRenderer.invoke('get-shop-logo')
+      const [{ data: inv }, { data: items }, { data: shopSettings }] = await Promise.all([
+        supabase.from('invoices').select('*').eq('id', invoiceId).maybeSingle(),
+        supabase.from('invoice_items').select('*').eq('invoice_id', invoiceId),
+        supabase.from('shop_settings').select('*').limit(1).maybeSingle(),
       ])
-      setInvoice(inv)
+      setInvoice(inv ? { ...inv, items: items || [] } : null)
       setShop(shopSettings || {})
-      setLogoUrl(logo)
     }
     load()
   }, [invoiceId])
 
   useEffect(() => {
-    window.ipcRenderer.on('thermal-print-result', (result) => {
-      setThermalStatus(result.success ? 'success' : 'error')
-      if (!result.success) setThermalError(result.message || 'Print failed')
-    })
-  }, [])
-
-  useEffect(() => {
     if (!invoice) return
-    if (shop.thermal_printing_enabled && shop.thermal_printer_name) {
-      // Direct-to-printer mode: skip the OS print dialog entirely. Main process does the
-      // actual printing once it sees this signal (it re-reads settings itself) and reports
-      // back via 'thermal-print-result' so we can show success/failure here.
-      setThermalStatus('printing')
-      const t = setTimeout(() => window.ipcRenderer.send('invoice-print-ready'), 300)
-      return () => clearTimeout(t)
-    }
     const t = setTimeout(() => window.print(), 300)
     return () => clearTimeout(t)
-  }, [invoice, shop])
+  }, [invoice])
 
   if (!invoice) {
     return <div style={{ padding: 20, fontFamily: 'sans-serif' }}>Loading invoice...</div>
@@ -50,8 +34,6 @@ export default function InvoicePrint({ invoiceId }) {
 
   const subtotal = invoice.items.reduce((sum, item) => sum + item.subtotal + (item.discount || 0), 0)
   const itemDiscounts = invoice.items.reduce((sum, item) => sum + (item.discount || 0), 0)
-
-  const isThermalMode = shop.thermal_printing_enabled && shop.thermal_printer_name
 
   return (
     <div style={{ fontFamily: "'Courier New', monospace", fontSize: 13, color: '#000', padding: 16, maxWidth: Math.round(340 * (paperWidth / 80)), margin: '0 auto' }}>
@@ -63,41 +45,19 @@ export default function InvoicePrint({ invoiceId }) {
         body { background: #fff; }
       `}</style>
 
-      {isThermalMode ? (
-        <div className="no-print" style={{ marginBottom: 16, fontFamily: 'sans-serif', fontSize: 13 }}>
-          {thermalStatus === 'printing' && (
-            <div style={{ padding: '8px 0', color: '#374151' }}>Sending to {shop.thermal_printer_name}...</div>
-          )}
-          {thermalStatus === 'success' && (
-            <div style={{ padding: '8px 0', color: '#059669' }}>✓ Sent to {shop.thermal_printer_name}</div>
-          )}
-          {thermalStatus === 'error' && (
-            <>
-              <div style={{ padding: '8px 0', color: '#dc2626' }}>✗ Thermal print failed: {thermalError}</div>
-              <button
-                onClick={() => window.print()}
-                style={{ width: '100%', padding: '8px 0', background: '#2563eb', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer' }}
-              >
-                Print via dialog instead
-              </button>
-            </>
-          )}
-        </div>
-      ) : (
-        <button
-          onClick={() => window.print()}
-          className="no-print"
-          style={{ width: '100%', padding: '8px 0', marginBottom: 16, background: '#2563eb', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontFamily: 'sans-serif' }}
-        >
-          Print
-        </button>
-      )}
+      <button
+        onClick={() => window.print()}
+        className="no-print"
+        style={{ width: '100%', padding: '8px 0', marginBottom: 16, background: '#2563eb', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontFamily: 'sans-serif' }}
+      >
+        Print
+      </button>
 
       <div style={{ textAlign: 'center', marginBottom: 8 }}>
-        {logoUrl && (
-          <img src={logoUrl} alt="Logo" style={{ maxWidth: 80, maxHeight: 80, margin: '0 auto 6px', display: 'block' }} />
+        {shop.logo_path && (
+          <img src={shop.logo_path} alt="Logo" style={{ maxWidth: 80, maxHeight: 80, margin: '0 auto 6px', display: 'block' }} />
         )}
-        <div style={{ fontSize: 18, fontWeight: 'bold' }}>{shop.shop_name || 'Modern Fashion Bazaar'}</div>
+        <div style={{ fontSize: 18, fontWeight: 'bold' }}>{shop.shop_name || 'CRM'}</div>
         {shop.shop_address && <div>{shop.shop_address}</div>}
         {shop.shop_phone && <div>Ph: {shop.shop_phone}</div>}
         {shop.gst_number && <div>GSTIN: {shop.gst_number}</div>}
@@ -107,7 +67,7 @@ export default function InvoicePrint({ invoiceId }) {
 
       <div style={{ display: 'flex', justifyContent: 'space-between' }}>
         <span>Bill #: {invoice.bill_number}</span>
-        <span>{new Date(invoice.invoice_date).toLocaleString()}</span>
+        <span>{new Date(invoice.invoice_date || invoice.created_at || new Date().toISOString()).toLocaleString()}</span>
       </div>
       {invoice.customer_name && (
         <div>Customer: {invoice.customer_name}{invoice.customer_phone ? ` (${invoice.customer_phone})` : ''}</div>

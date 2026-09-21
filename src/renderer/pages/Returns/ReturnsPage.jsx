@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react'
-import { useSelector } from 'react-redux'
 import { useSearchParams } from 'react-router-dom'
 import Navbar from '../../components/Navbar'
 import Sidebar from '../../components/Sidebar'
+import EmptyState from '../../components/EmptyState'
+import { TableSkeleton } from '../../components/Skeleton'
+import { supabase } from '../../lib/supabaseClient'
 
 function Field({ label, className = '', children }) {
   return (
@@ -14,7 +16,6 @@ function Field({ label, className = '', children }) {
 }
 
 export default function ReturnsPage() {
-  const user = useSelector(state => state.auth.user)
   const [searchParams] = useSearchParams()
 
   const [billQuery, setBillQuery] = useState(searchParams.get('bill') || '')
@@ -31,29 +32,76 @@ export default function ReturnsPage() {
   const [returnsList, setReturnsList] = useState([])
   const [historySearch, setHistorySearch] = useState('')
   const [viewingReturn, setViewingReturn] = useState(null)
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    loadReturns()
-    loadDamageLog()
+    Promise.all([loadReturns(), loadDamageLog()]).finally(() => setLoading(false))
     const initialBill = searchParams.get('bill')
     if (initialBill) runSearch(initialBill)
   }, [])
 
   const loadReturns = async () => {
-    const data = await window.ipcRenderer.invoke('get-returns')
-    setReturnsList(data)
+    const { data, error: err } = await supabase
+      .from('returns')
+      .select('*, invoices(bill_number, customer_name)')
+      .order('return_date', { ascending: false })
+
+    if (err) {
+      setReturnsList([])
+      return
+    }
+
+    setReturnsList((data || []).map(r => ({
+      ...r,
+      bill_number: r.invoices?.bill_number,
+      customer_name: r.invoices?.customer_name,
+    })))
   }
 
   const loadDamageLog = async () => {
-    const data = await window.ipcRenderer.invoke('get-damage-log')
-    setDamageLog(data)
+    const { data, error: err } = await supabase
+      .from('return_items')
+      .select('id, quantity, subtotal, disposition, products(name), returns(return_number, return_date, reason, invoices(bill_number))')
+      .eq('restocked', false)
+      .order('return_date', { foreignTable: 'returns', ascending: false })
+
+    if (err) {
+      setDamageLog([])
+      return
+    }
+
+    setDamageLog((data || []).map(item => ({
+      id: item.id,
+      quantity: item.quantity,
+      subtotal: item.subtotal,
+      disposition: item.disposition,
+      product_name: item.products?.name,
+      return_number: item.returns?.return_number,
+      return_date: item.returns?.return_date,
+      return_reason: item.returns?.reason,
+      bill_number: item.returns?.invoices?.bill_number,
+    })))
   }
 
   const runSearch = async (query) => {
     setError('')
     setSelectedInvoice(null)
-    if (!query.trim()) return
-    const results = await window.ipcRenderer.invoke('find-invoice-for-return', query.trim())
+    const trimmed = query.trim()
+    if (!trimmed) return
+
+    const { data, error: err } = await supabase
+      .from('invoices')
+      .select('*')
+      .ilike('bill_number', `%${trimmed}%`)
+      .order('invoice_date', { ascending: false })
+      .limit(10)
+
+    if (err) {
+      setSearchResults([])
+      return
+    }
+
+    const results = data || []
     setSearchResults(results)
     if (results.length === 1) {
       openInvoice(results[0].id)
@@ -68,11 +116,27 @@ export default function ReturnsPage() {
   const openInvoice = async (invoiceId) => {
     setError('')
     setMessage('')
-    const detail = await window.ipcRenderer.invoke('get-invoice-return-details', invoiceId)
-    if (!detail) {
+
+    const { data: invoice, error: invoiceError } = await supabase
+      .from('invoices')
+      .select('*')
+      .eq('id', invoiceId)
+      .maybeSingle()
+
+    if (invoiceError || !invoice) {
       setError('Invoice not found')
       return
     }
+
+    const { data: items, error: itemsError } = await supabase
+      .rpc('get_invoice_return_details', { p_invoice_id: invoiceId })
+
+    if (itemsError) {
+      setError('Invoice not found')
+      return
+    }
+
+    const detail = { ...invoice, items: items || [] }
     setSelectedInvoice(detail)
     setSearchResults([])
     const initialLines = {}
@@ -114,7 +178,7 @@ export default function ReturnsPage() {
 
     const items = Object.entries(lines)
       .filter(([, v]) => v.quantity > 0)
-      .map(([invoiceItemId, v]) => ({ invoiceItemId: Number(invoiceItemId), quantity: v.quantity, restock: v.restock, disposition: v.restock ? null : v.disposition }))
+      .map(([invoiceItemId, v]) => ({ invoiceItemId, quantity: v.quantity, restock: v.restock, disposition: v.restock ? null : v.disposition }))
 
     if (items.length === 0) {
       setError('Enter a quantity to return for at least one item')
@@ -126,27 +190,51 @@ export default function ReturnsPage() {
       return
     }
 
-    const result = await window.ipcRenderer.invoke('create-return', {
-      invoiceId: selectedInvoice.id,
-      items,
-      reason,
-      refundMode,
-      userId: user?.id
+    const { error: err } = await supabase.rpc('create_return', {
+      p_invoice_id: selectedInvoice.id,
+      p_items: items.map(i => ({
+        invoice_item_id: i.invoiceItemId,
+        quantity: i.quantity,
+        restock: i.restock,
+        disposition: i.disposition,
+      })),
+      p_reason: reason || null,
+      p_refund_mode: refundMode,
     })
 
-    if (result.success) {
+    if (!err) {
       loadReturns()
       loadDamageLog()
       await openInvoice(selectedInvoice.id)
       setMessage(`Return processed - refund ₹${refundTotal.toFixed(2)}`)
     } else {
-      setError(result.message || 'Failed to process return')
+      setError(err.message || 'Failed to process return')
     }
   }
 
   const openReturnDetail = async (returnId) => {
-    const detail = await window.ipcRenderer.invoke('get-return', returnId)
-    setViewingReturn(detail)
+    const { data: ret, error: retError } = await supabase
+      .from('returns')
+      .select('*, invoices(bill_number, customer_name)')
+      .eq('id', returnId)
+      .maybeSingle()
+
+    if (retError || !ret) {
+      setViewingReturn(null)
+      return
+    }
+
+    const { data: items } = await supabase
+      .from('return_items')
+      .select('*, products(name)')
+      .eq('return_id', returnId)
+
+    setViewingReturn({
+      ...ret,
+      bill_number: ret.invoices?.bill_number,
+      customer_name: ret.invoices?.customer_name,
+      items: (items || []).map(item => ({ ...item, product_name: item.products?.name })),
+    })
   }
 
   const filteredReturns = returnsList.filter(r => {
@@ -166,7 +254,7 @@ export default function ReturnsPage() {
       <Sidebar />
       <div className="flex-1">
         <Navbar />
-        <div className="p-8">
+        <div className="p-4 sm:p-8">
           <h1 className="text-3xl font-bold mb-6">Returns & Refunds</h1>
 
           <div className="bg-white rounded-lg shadow p-6 mb-6">
@@ -200,7 +288,7 @@ export default function ReturnsPage() {
               </div>
             )}
             {searchResults.length === 0 && billQuery && !selectedInvoice && (
-              <p className="text-gray-400 text-sm">No matching invoices. Try Find Invoice above.</p>
+              <EmptyState title="No matching invoices" message="Check the bill number and try again." />
             )}
 
             {selectedInvoice && (
@@ -244,7 +332,7 @@ export default function ReturnsPage() {
                       const effectiveUnitPrice = item.subtotal / item.quantity
                       const q = lines[item.id]?.quantity || 0
                       return (
-                        <tr key={item.id} className="border-b">
+                        <tr key={item.id} className="row-in border-b">
                           <td className="py-2 px-2">{item.product_name}</td>
                           <td className="py-2 px-2 text-right">{item.quantity}</td>
                           <td className="py-2 px-2 text-right text-gray-500">{item.already_returned}</td>
@@ -294,7 +382,7 @@ export default function ReturnsPage() {
                 </table>
                 </div>
 
-                <div className="grid grid-cols-2 gap-4 mb-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
                   <Field label="Reason (optional)">
                     <input
                       type="text"
@@ -337,34 +425,52 @@ export default function ReturnsPage() {
               className="w-full px-4 py-2 border rounded"
             />
           </Field>
-          <div className="bg-white rounded-lg shadow overflow-hidden">
-            <table className="w-full">
-              <thead className="bg-gray-100 border-b">
-                <tr>
-                  <th className="px-6 py-3 text-left">Return #</th>
-                  <th className="px-6 py-3 text-left">Bill #</th>
-                  <th className="px-6 py-3 text-left">Customer</th>
-                  <th className="px-6 py-3 text-left">Date</th>
-                  <th className="px-6 py-3 text-left">Mode</th>
-                  <th className="px-6 py-3 text-right">Refund</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredReturns.map(r => (
-                  <tr key={r.id} className="border-b hover:bg-gray-50 cursor-pointer" onClick={() => openReturnDetail(r.id)}>
-                    <td className="px-6 py-3">{r.return_number}</td>
-                    <td className="px-6 py-3">{r.bill_number}</td>
-                    <td className="px-6 py-3">{r.customer_name || 'Walk-in'}</td>
-                    <td className="px-6 py-3">{new Date(r.return_date).toLocaleString()}</td>
-                    <td className="px-6 py-3">{r.refund_mode === 'cash' ? 'Cash Refund' : 'Adjust Against Due'}</td>
-                    <td className="px-6 py-3 text-right">₹{r.refund_amount.toFixed(2)}</td>
+          <div className="bg-white rounded-lg shadow overflow-hidden overflow-x-auto">
+            {loading ? (
+              <table className="w-full">
+                <thead className="bg-gray-100 border-b">
+                  <tr>
+                    <th className="px-6 py-3 text-left">Return #</th>
+                    <th className="px-6 py-3 text-left">Bill #</th>
+                    <th className="px-6 py-3 text-left">Customer</th>
+                    <th className="px-6 py-3 text-left">Date</th>
+                    <th className="px-6 py-3 text-left">Mode</th>
+                    <th className="px-6 py-3 text-right">Refund</th>
                   </tr>
-                ))}
-                {filteredReturns.length === 0 && (
-                  <tr><td colSpan="6" className="px-6 py-6 text-center text-gray-400">No returns recorded yet</td></tr>
-                )}
-              </tbody>
-            </table>
+                </thead>
+                <TableSkeleton rows={5} cols={6} />
+              </table>
+            ) : filteredReturns.length === 0 ? (
+              <EmptyState
+                title={historySearch ? 'No matching returns' : 'No returns recorded yet'}
+                message={historySearch ? 'Try a different search term.' : 'Processed returns will show up here.'}
+              />
+            ) : (
+              <table className="w-full">
+                <thead className="bg-gray-100 border-b">
+                  <tr>
+                    <th className="px-6 py-3 text-left">Return #</th>
+                    <th className="px-6 py-3 text-left">Bill #</th>
+                    <th className="px-6 py-3 text-left">Customer</th>
+                    <th className="px-6 py-3 text-left">Date</th>
+                    <th className="px-6 py-3 text-left">Mode</th>
+                    <th className="px-6 py-3 text-right">Refund</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredReturns.map(r => (
+                    <tr key={r.id} className="row-in border-b hover:bg-gray-50 cursor-pointer" onClick={() => openReturnDetail(r.id)}>
+                      <td className="px-6 py-3">{r.return_number}</td>
+                      <td className="px-6 py-3">{r.bill_number}</td>
+                      <td className="px-6 py-3">{r.customer_name || 'Walk-in'}</td>
+                      <td className="px-6 py-3">{new Date(r.return_date).toLocaleString()}</td>
+                      <td className="px-6 py-3">{r.refund_mode === 'cash' ? 'Cash Refund' : 'Adjust Against Due'}</td>
+                      <td className="px-6 py-3 text-right">₹{r.refund_amount.toFixed(2)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
           </div>
 
           <h2 className="text-xl font-bold mb-3 mt-8">Damaged / Defective Log</h2>
@@ -377,45 +483,63 @@ export default function ReturnsPage() {
               className="w-full px-4 py-2 border rounded"
             />
           </Field>
-          <div className="bg-white rounded-lg shadow overflow-hidden">
-            <table className="w-full">
-              <thead className="bg-gray-100 border-b">
-                <tr>
-                  <th className="px-6 py-3 text-left">Date</th>
-                  <th className="px-6 py-3 text-left">Product</th>
-                  <th className="px-6 py-3 text-right">Qty</th>
-                  <th className="px-6 py-3 text-left">Reason</th>
-                  <th className="px-6 py-3 text-left">Bill #</th>
-                  <th className="px-6 py-3 text-left">Return #</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredDamageLog.map(d => (
-                  <tr key={d.id} className="border-b hover:bg-gray-50">
-                    <td className="px-6 py-3">{new Date(d.return_date).toLocaleDateString()}</td>
-                    <td className="px-6 py-3">{d.product_name}</td>
-                    <td className="px-6 py-3 text-right">{d.quantity}</td>
-                    <td className="px-6 py-3">
-                      <span className="px-2 py-0.5 rounded text-xs bg-red-100 text-red-700">
-                        {dispositionLabel[d.disposition] || d.disposition || 'Other'}
-                      </span>
-                    </td>
-                    <td className="px-6 py-3">{d.bill_number}</td>
-                    <td className="px-6 py-3">{d.return_number}</td>
+          <div className="bg-white rounded-lg shadow overflow-hidden overflow-x-auto">
+            {loading ? (
+              <table className="w-full">
+                <thead className="bg-gray-100 border-b">
+                  <tr>
+                    <th className="px-6 py-3 text-left">Date</th>
+                    <th className="px-6 py-3 text-left">Product</th>
+                    <th className="px-6 py-3 text-right">Qty</th>
+                    <th className="px-6 py-3 text-left">Reason</th>
+                    <th className="px-6 py-3 text-left">Bill #</th>
+                    <th className="px-6 py-3 text-left">Return #</th>
                   </tr>
-                ))}
-                {filteredDamageLog.length === 0 && (
-                  <tr><td colSpan="6" className="px-6 py-6 text-center text-gray-400">No damaged/defective items logged yet</td></tr>
-                )}
-              </tbody>
-            </table>
+                </thead>
+                <TableSkeleton rows={5} cols={6} />
+              </table>
+            ) : filteredDamageLog.length === 0 ? (
+              <EmptyState
+                title={damageSearch ? 'No matching items' : 'No damaged/defective items logged yet'}
+                message={damageSearch ? 'Try a different search term.' : 'Items marked damaged or defective during a return show up here.'}
+              />
+            ) : (
+              <table className="w-full">
+                <thead className="bg-gray-100 border-b">
+                  <tr>
+                    <th className="px-6 py-3 text-left">Date</th>
+                    <th className="px-6 py-3 text-left">Product</th>
+                    <th className="px-6 py-3 text-right">Qty</th>
+                    <th className="px-6 py-3 text-left">Reason</th>
+                    <th className="px-6 py-3 text-left">Bill #</th>
+                    <th className="px-6 py-3 text-left">Return #</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredDamageLog.map(d => (
+                    <tr key={d.id} className="row-in border-b hover:bg-gray-50">
+                      <td className="px-6 py-3">{new Date(d.return_date).toLocaleDateString()}</td>
+                      <td className="px-6 py-3">{d.product_name}</td>
+                      <td className="px-6 py-3 text-right">{d.quantity}</td>
+                      <td className="px-6 py-3">
+                        <span className="px-2 py-0.5 rounded text-xs bg-red-100 text-red-700">
+                          {dispositionLabel[d.disposition] || d.disposition || 'Other'}
+                        </span>
+                      </td>
+                      <td className="px-6 py-3">{d.bill_number}</td>
+                      <td className="px-6 py-3">{d.return_number}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
           </div>
         </div>
       </div>
 
       {viewingReturn && (
-        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-20">
-          <div className="bg-white rounded-lg shadow-lg p-6 w-full max-w-lg max-h-[80vh] overflow-y-auto">
+        <div className="overlay-in fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-20">
+          <div className="panel-in bg-white rounded-lg shadow-lg p-6 w-full max-w-lg max-h-[80vh] overflow-y-auto">
             <div className="flex justify-between items-start mb-4">
               <div>
                 <h2 className="text-xl font-bold">{viewingReturn.return_number}</h2>
@@ -436,7 +560,7 @@ export default function ReturnsPage() {
               </thead>
               <tbody>
                 {viewingReturn.items.map(item => (
-                  <tr key={item.id} className="border-b">
+                  <tr key={item.id} className="row-in border-b">
                     <td className="py-2">{item.product_name}</td>
                     <td className="py-2 text-right">{item.quantity}</td>
                     <td className="py-2 text-right">₹{item.subtotal.toFixed(2)}</td>

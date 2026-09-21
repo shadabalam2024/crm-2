@@ -1,8 +1,11 @@
 node_modules/
 dist/
-dist-electron/
-release/
+.DS_Store
+
 .env
+
+# Supabase CLI local state (project ref, pooler host) — not project source
+supabase/.temp/
 
 # throwaway test-harness scripts (see scripts/launch-test-app.mjs)
 __test_*.mjs

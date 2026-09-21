@@ -1,10 +1,10 @@
 import { useState, useEffect } from 'react'
-import { HashRouter, Routes, Route } from 'react-router-dom'
-import { Provider, useSelector } from 'react-redux'
-import { store } from './store'
+import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { useDispatch, useSelector } from 'react-redux'
 import Login from './pages/Login'
-import Activation from './pages/Activation'
-import CreateAdmin from './pages/CreateAdmin'
+import { setUser } from './store/slices/auth'
+import { supabase } from './lib/supabaseClient'
+import { getPermissionsForRole } from './utils/permissions'
 import Dashboard from './pages/Dashboard'
 import BillingPage from './pages/Billing/BillingPage'
 import InventoryPage from './pages/Inventory/InventoryPage'
@@ -22,7 +22,7 @@ function AuthGate() {
   if (!user) return <Login />
 
   return (
-    <HashRouter>
+    <BrowserRouter>
       <Routes>
         <Route path="/" element={<Dashboard />} />
         <Route path="/billing" element={<BillingPage />} />
@@ -33,47 +33,65 @@ function AuthGate() {
         <Route path="/daily-closing" element={<DailyClosingPage />} />
         <Route path="/analytics" element={<AnalyticsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
+        <Route path="/print/:invoiceId" element={<InvoicePrint />} />
       </Routes>
-    </HashRouter>
+    </BrowserRouter>
   )
 }
 
 function App() {
-  const [licensed, setLicensed] = useState(null)
-  const [adminExists, setAdminExists] = useState(null)
-
-  const printMatch = window.location.hash.match(/^#print=(\d+)/)
+  const dispatch = useDispatch()
+  const [isReady, setIsReady] = useState(false)
+  const [sessionChecked, setSessionChecked] = useState(false)
 
   useEffect(() => {
-    if (printMatch) return
-    checkLicense()
-    checkAdminExists()
-  }, [])
+    const restoreSession = async () => {
+      try {
+        const { data: { session } } = await supabase.auth.getSession()
 
-  const checkLicense = async () => {
-    const result = await window.ipcRenderer.invoke('check-license')
-    setLicensed(result.licensed)
+        if (!session?.user) {
+          setSessionChecked(true)
+          setIsReady(true)
+          return
+        }
+
+        const { data: profile, error: profileError } = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('id', session.user.id)
+          .maybeSingle()
+
+        const role = profile?.role || 'Cashier'
+        const permissions = await getPermissionsForRole(role)
+
+        dispatch(setUser({
+          user: {
+            id: session.user.id,
+            email: session.user.email,
+            role,
+            permissions,
+          },
+          permissions,
+        }))
+      } catch (error) {
+        console.warn('Session restore failed:', error)
+      } finally {
+        setSessionChecked(true)
+        setIsReady(true)
+      }
+    }
+
+    const timer = setTimeout(() => setIsReady(true), 200)
+    restoreSession()
+
+    return () => clearTimeout(timer)
+  }, [dispatch])
+
+  if (!isReady || !sessionChecked) {
+    return <div className="flex items-center justify-center h-screen">Loading...</div>
   }
 
-  const checkAdminExists = async () => {
-    const exists = await window.ipcRenderer.invoke('check-admin-exists')
-    setAdminExists(exists)
-  }
-
-  let content
-  if (printMatch) {
-    content = <InvoicePrint invoiceId={printMatch[1]} />
-  } else if (licensed === null || adminExists === null) {
-    content = <div className="flex items-center justify-center h-screen">Loading...</div>
-  } else if (!licensed) {
-    content = <Activation onActivated={() => setLicensed(true)} />
-  } else if (!adminExists) {
-    content = <CreateAdmin onCreated={() => setAdminExists(true)} />
-  } else {
-    content = <AuthGate />
-  }
-
-  return <Provider store={store}>{content}</Provider>
+  return <AuthGate />
 }
 
 export default App

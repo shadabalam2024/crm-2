@@ -1,32 +1,22 @@
-# Electronics Shop CRM
+# CRM
 
-A desktop point-of-sale and inventory management system for electronics retail shops.
+A web-based point-of-sale and inventory management system for retail shops — billing, inventory, purchasing, customers, returns, daily cash closing, and analytics, backed entirely by Supabase.
 
-## Features
+## Docs
 
-- Billing & Invoicing with barcode scanning
-- Inventory Management
-- Purchase Orders
-- Customer Credit Tracking
-- Sales Analytics & Reports
-- Role-based Access Control
-- Machine ID-based Licensing
-- Auto-update via GitHub
+- **[docs/DOCUMENTATION.md](docs/DOCUMENTATION.md)** — backend choice, services used, security model and how it's verified, setup from zero, demo data and test logins. Start here.
+- **[docs/DATA_MODEL.md](docs/DATA_MODEL.md)** — full schema reference: every table, column, relationship, and RPC function.
 
-## Installation
+## Quick start
 
-1. Clone the repository
-2. `npm install`
-3. `npm run dev` (for development)
-4. `npm run build` (to build for distribution)
+```bash
+npm install
+cp .env.example .env   # fill in VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY
+npm run dev
+```
 
-## Architecture
+For provisioning a Supabase project from scratch (schema, RLS, demo data, test logins), see [docs/DOCUMENTATION.md](docs/DOCUMENTATION.md).
 
-- Frontend: React 18 + Redux
-- Desktop: Electron
-- Database: SQLite
-- Styling: Tailwind CSS
+## Stack
 
-## License
-
-Proprietary - All rights reserved
+React 18 + Redux Toolkit + React Router + Tailwind + Recharts, on Vite. Supabase (Postgres, Auth, Storage, Edge Functions, Row Level Security) for everything else — no separate backend server.

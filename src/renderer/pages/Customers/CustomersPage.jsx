@@ -1,6 +1,9 @@
 import { useState, useEffect } from 'react'
 import Navbar from '../../components/Navbar'
 import Sidebar from '../../components/Sidebar'
+import EmptyState from '../../components/EmptyState'
+import { TableSkeleton } from '../../components/Skeleton'
+import { supabase } from '../../lib/supabaseClient'
 
 function Field({ label, className = '', children }) {
   return (
@@ -26,14 +29,26 @@ export default function CustomersPage() {
   const [viewingDetail, setViewingDetail] = useState(null)
   const [viewingPayments, setViewingPayments] = useState(null)
   const [search, setSearch] = useState('')
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     loadCustomers()
   }, [])
 
   const loadCustomers = async () => {
-    const data = await window.ipcRenderer.invoke('get-customers')
-    setCustomers(data)
+    const { data, error } = await supabase
+      .from('customers')
+      .select('*')
+      .order('created_at', { ascending: false })
+
+    if (error) {
+      setCustomers([])
+      setLoading(false)
+      return
+    }
+
+    setCustomers(data || [])
+    setLoading(false)
   }
 
   const openAddForm = () => {
@@ -60,16 +75,29 @@ export default function CustomersPage() {
     e.preventDefault()
     setError('')
 
-    const result = editingId
-      ? await window.ipcRenderer.invoke('update-customer', { id: editingId, ...form })
-      : await window.ipcRenderer.invoke('add-customer', form)
+    if (editingId) {
+      const { error } = await supabase
+        .from('customers')
+        .update(form)
+        .eq('id', editingId)
 
-    if (result.success) {
-      setShowForm(false)
-      loadCustomers()
+      if (error) {
+        setError(error.message || 'Failed to save customer')
+        return
+      }
     } else {
-      setError(result.message || 'Failed to save customer')
+      const { error } = await supabase
+        .from('customers')
+        .insert([{ ...form, created_at: new Date().toISOString() }])
+
+      if (error) {
+        setError(error.message || 'Failed to save customer')
+        return
+      }
     }
+
+    setShowForm(false)
+    loadCustomers()
   }
 
   const openPayment = (customer) => {
@@ -80,28 +108,40 @@ export default function CustomersPage() {
 
   const handleRecordPayment = async (e) => {
     e.preventDefault()
-    const result = await window.ipcRenderer.invoke('record-customer-payment', {
-      customerId: payingCustomer.id,
-      amount: parseFloat(paymentAmount) || 0,
-      paymentMode
+    const { error } = await supabase.rpc('record_customer_payment', {
+      p_customer_id: payingCustomer.id,
+      p_amount: parseFloat(paymentAmount) || 0,
+      p_payment_mode: paymentMode,
     })
-    if (result.success) {
+    if (!error) {
       setPayingCustomer(null)
       loadCustomers()
       if (viewingCustomer?.id === payingCustomer.id) openView(payingCustomer)
     } else {
-      alert(result.message || 'Failed to record payment')
+      alert(error.message || 'Failed to record payment')
     }
   }
 
   const openView = async (customer) => {
     setViewingCustomer(customer)
-    window.ipcRenderer.invoke('get-customer', customer.id)
-      .then(setViewingDetail)
-      .catch(() => setViewingDetail({ invoices: [] }))
-    window.ipcRenderer.invoke('get-customer-payments', customer.id)
-      .then(setViewingPayments)
-      .catch(() => setViewingPayments([]))
+    setViewingDetail(null)
+    setViewingPayments(null)
+
+    supabase
+      .from('invoices')
+      .select('*')
+      .eq('customer_id', customer.id)
+      .order('invoice_date', { ascending: false })
+      .then(({ data }) => setViewingDetail({ invoices: data || [] }))
+
+    supabase
+      .from('customer_payments')
+      .select('*, invoices(bill_number)')
+      .eq('customer_id', customer.id)
+      .order('payment_date', { ascending: false })
+      .then(({ data }) => setViewingPayments(
+        (data || []).map(p => ({ ...p, bill_number: p.invoices?.bill_number }))
+      ))
   }
 
   const filteredCustomers = customers.filter(c =>
@@ -115,8 +155,8 @@ export default function CustomersPage() {
       <Sidebar />
       <div className="flex-1">
         <Navbar />
-        <div className="p-8">
-          <div className="flex justify-between items-center mb-6">
+        <div className="p-4 sm:p-8">
+          <div className="flex flex-wrap justify-between items-center gap-3 mb-6">
             <h1 className="text-3xl font-bold">Customers</h1>
             <button onClick={openAddForm} className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">
               + Add Customer
@@ -134,51 +174,63 @@ export default function CustomersPage() {
           </Field>
 
           <div className="bg-white rounded-lg shadow overflow-hidden">
-            <table className="w-full">
-              <thead className="bg-gray-100 border-b">
-                <tr>
-                  <th className="px-6 py-3 text-left">Name</th>
-                  <th className="px-6 py-3 text-left">Phone</th>
-                  <th className="px-6 py-3 text-left">Email</th>
-                  <th className="px-6 py-3 text-center">Recurring</th>
-                  <th className="px-6 py-3 text-right">Credit Balance</th>
-                  <th className="px-6 py-3 text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredCustomers.map(c => (
-                  <tr key={c.id} className="border-b hover:bg-gray-50">
-                    <td className="px-6 py-4">
-                      <button onClick={() => openView(c)} className="text-blue-600 hover:underline">{c.name}</button>
-                    </td>
-                    <td className="px-6 py-4">{c.phone}</td>
-                    <td className="px-6 py-4 text-gray-500">{c.email}</td>
-                    <td className="px-6 py-4 text-center">{c.is_recurring ? '✓' : ''}</td>
-                    <td className={`px-6 py-4 text-right ${c.credit_balance > 0 ? 'text-orange-600 font-bold' : ''}`}>
-                      ₹{c.credit_balance.toFixed(0)}
-                    </td>
-                    <td className="px-6 py-4 text-right space-x-3 whitespace-nowrap">
-                      {c.credit_balance > 0 && (
-                        <button onClick={() => openPayment(c)} className="text-green-600 hover:underline">Record Payment</button>
-                      )}
-                      <button onClick={() => openEditForm(c)} className="text-blue-600 hover:underline">Edit</button>
-                    </td>
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead className="bg-gray-100 border-b">
+                  <tr>
+                    <th className="px-6 py-3 text-left">Name</th>
+                    <th className="px-6 py-3 text-left">Phone</th>
+                    <th className="px-6 py-3 text-left">Email</th>
+                    <th className="px-6 py-3 text-center">Recurring</th>
+                    <th className="px-6 py-3 text-right">Credit Balance</th>
+                    <th className="px-6 py-3 text-right">Actions</th>
                   </tr>
-                ))}
-                {filteredCustomers.length === 0 && (
-                  <tr><td colSpan="6" className="py-8 text-center text-gray-400">
-                    {search.trim() ? 'No customers match your search' : 'No customers yet'}
-                  </td></tr>
+                </thead>
+                {loading ? (
+                  <TableSkeleton rows={6} cols={6} />
+                ) : filteredCustomers.length === 0 ? (
+                  <tbody>
+                    <tr><td colSpan="6">
+                      <EmptyState
+                        title={search.trim() ? 'No customers match your search' : 'No customers yet'}
+                        message={search.trim() ? undefined : 'Add your first customer to start tracking credit sales.'}
+                        actionLabel={search.trim() ? undefined : '+ Add Customer'}
+                        onAction={search.trim() ? undefined : openAddForm}
+                      />
+                    </td></tr>
+                  </tbody>
+                ) : (
+                  <tbody>
+                    {filteredCustomers.map(c => (
+                      <tr key={c.id} className="row-in border-b hover:bg-gray-50">
+                        <td className="px-6 py-4">
+                          <button onClick={() => openView(c)} className="text-blue-600 hover:underline">{c.name}</button>
+                        </td>
+                        <td className="px-6 py-4">{c.phone}</td>
+                        <td className="px-6 py-4 text-gray-500">{c.email}</td>
+                        <td className="px-6 py-4 text-center">{c.is_recurring ? '✓' : ''}</td>
+                        <td className={`px-6 py-4 text-right ${c.credit_balance > 0 ? 'text-orange-600 font-bold' : ''}`}>
+                          ₹{c.credit_balance.toFixed(0)}
+                        </td>
+                        <td className="px-6 py-4 text-right space-x-3 whitespace-nowrap">
+                          {c.credit_balance > 0 && (
+                            <button onClick={() => openPayment(c)} className="text-green-600 hover:underline">Record Payment</button>
+                          )}
+                          <button onClick={() => openEditForm(c)} className="text-blue-600 hover:underline">Edit</button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
                 )}
-              </tbody>
-            </table>
+              </table>
+            </div>
           </div>
         </div>
       </div>
 
       {showForm && (
-        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-20">
-          <div className="bg-white rounded-lg shadow-lg p-6 w-full max-w-md">
+        <div className="overlay-in fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-20">
+          <div className="panel-in bg-white rounded-lg shadow-lg p-6 w-full max-w-md">
             <h2 className="text-xl font-bold mb-4">{editingId ? 'Edit Customer' : 'Add Customer'}</h2>
             <form onSubmit={handleSubmit}>
               <Field label="Name" className="mb-3">
@@ -234,8 +286,8 @@ export default function CustomersPage() {
       )}
 
       {payingCustomer && (
-        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-20">
-          <div className="bg-white rounded-lg shadow-lg p-6 w-full max-w-sm">
+        <div className="overlay-in fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-20">
+          <div className="panel-in bg-white rounded-lg shadow-lg p-6 w-full max-w-sm">
             <h2 className="text-xl font-bold mb-1">Record Payment</h2>
             <p className="text-sm text-gray-500 mb-4">
               {payingCustomer.name} · Balance ₹{payingCustomer.credit_balance.toFixed(0)}
@@ -268,8 +320,8 @@ export default function CustomersPage() {
       )}
 
       {viewingCustomer && (
-        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-20">
-          <div className="bg-white rounded-lg shadow-lg p-6 w-full max-w-lg max-h-[80vh] overflow-y-auto">
+        <div className="overlay-in fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-20">
+          <div className="panel-in bg-white rounded-lg shadow-lg p-6 w-full max-w-lg max-h-[80vh] overflow-y-auto">
             <div className="flex justify-between items-start mb-4">
               <div>
                 <h2 className="text-xl font-bold">{viewingCustomer.name}</h2>
@@ -278,9 +330,11 @@ export default function CustomersPage() {
               <button onClick={() => { setViewingCustomer(null); setViewingDetail(null); setViewingPayments(null) }} className="text-gray-400 hover:text-gray-700">✕</button>
             </div>
             <h3 className="font-bold mb-2">Invoice History</h3>
-            {!viewingDetail && <p className="text-gray-400">Loading...</p>}
+            {!viewingDetail && (
+              <table className="w-full text-sm"><TableSkeleton rows={3} cols={4} /></table>
+            )}
             {viewingDetail && viewingDetail.invoices?.length === 0 && (
-              <p className="text-gray-400">No invoices yet</p>
+              <EmptyState title="No invoices yet" message="Invoices for this customer will show up here." />
             )}
             {viewingDetail && viewingDetail.invoices?.length > 0 && (
               <table className="w-full text-sm">
@@ -296,7 +350,7 @@ export default function CustomersPage() {
                   {viewingDetail.invoices.map(inv => {
                     const due = inv.total_amount - inv.amount_paid - (inv.refunded_amount || 0)
                     return (
-                      <tr key={inv.id} className="border-b">
+                      <tr key={inv.id} className="row-in border-b">
                         <td className="py-2">{inv.bill_number}</td>
                         <td className="py-2">{new Date(inv.invoice_date).toLocaleDateString()}</td>
                         <td className="py-2 text-right">₹{inv.total_amount.toFixed(2)}</td>
@@ -311,9 +365,11 @@ export default function CustomersPage() {
             )}
 
             <h3 className="font-bold mb-2 mt-6">Payment History</h3>
-            {!viewingPayments && <p className="text-gray-400">Loading...</p>}
+            {!viewingPayments && (
+              <table className="w-full text-sm"><TableSkeleton rows={3} cols={4} /></table>
+            )}
             {viewingPayments && viewingPayments.length === 0 && (
-              <p className="text-gray-400">No payments recorded yet</p>
+              <EmptyState title="No payments recorded yet" message="Payments recorded for this customer will show up here." />
             )}
             {viewingPayments && viewingPayments.length > 0 && (
               <table className="w-full text-sm">
@@ -327,7 +383,7 @@ export default function CustomersPage() {
                 </thead>
                 <tbody>
                   {viewingPayments.map(p => (
-                    <tr key={p.id} className="border-b">
+                    <tr key={p.id} className="row-in border-b">
                       <td className="py-2">{new Date(p.payment_date).toLocaleString()}</td>
                       <td className="py-2 text-gray-500">{p.bill_number || 'Advance / general'}</td>
                       <td className="py-2 text-gray-500 capitalize">{p.payment_mode || 'cash'}</td>

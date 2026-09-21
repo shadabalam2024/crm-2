@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react'
-import { useSelector } from 'react-redux'
 import Navbar from '../../components/Navbar'
 import Sidebar from '../../components/Sidebar'
+import EmptyState from '../../components/EmptyState'
+import { Skeleton, TableSkeleton } from '../../components/Skeleton'
+import { supabase } from '../../lib/supabaseClient'
 
 function Field({ label, className = '', children }) {
   return (
@@ -19,8 +21,6 @@ function todayStr() {
 }
 
 export default function DailyClosingPage() {
-  const user = useSelector(state => state.auth.user)
-
   const [date, setDate] = useState(todayStr())
   const [figures, setFigures] = useState(null)
   const [existing, setExisting] = useState(null)
@@ -30,6 +30,8 @@ export default function DailyClosingPage() {
   const [message, setMessage] = useState('')
 
   const [history, setHistory] = useState([])
+  const [historyLoading, setHistoryLoading] = useState(true)
+  const [previewLoading, setPreviewLoading] = useState(true)
 
   useEffect(() => {
     loadHistory()
@@ -40,18 +42,43 @@ export default function DailyClosingPage() {
   }, [date])
 
   const loadHistory = async () => {
-    const data = await window.ipcRenderer.invoke('get-closing-history', { limit: 60 })
-    setHistory(data)
+    const { data, error } = await supabase.rpc('get_closing_history', { p_limit: 60 })
+    setHistory(error ? [] : (data || []))
+    setHistoryLoading(false)
   }
 
   const loadPreview = async (d) => {
+    setPreviewLoading(true)
     setMessage('')
-    const preview = await window.ipcRenderer.invoke('get-closing-preview', d)
-    setFigures(preview.figures)
-    setExisting(preview.existing)
-    setOpeningCash(String(preview.existing ? preview.existing.opening_cash : preview.suggestedOpeningCash))
-    setActualCash(preview.existing ? String(preview.existing.actual_cash) : '')
-    setNotes(preview.existing?.notes || '')
+    const { data, error } = await supabase.rpc('get_closing_preview', { p_date: d })
+    const row = !error && data && data[0] ? data[0] : null
+
+    const figuresResult = {
+      cashSales: row?.cash_sales || 0,
+      cardSales: row?.card_sales || 0,
+      creditSales: row?.credit_sales || 0,
+      paymentsReceivedCash: row?.payments_received_cash || 0,
+      paymentsReceivedCard: row?.payments_received_card || 0,
+      refundsCash: row?.refunds_cash || 0
+    }
+    const existingResult = row?.existing_id ? {
+      id: row.existing_id,
+      closing_date: row.existing_closing_date,
+      opening_cash: row.existing_opening_cash,
+      actual_cash: row.existing_actual_cash,
+      expected_cash: row.existing_expected_cash,
+      variance: row.existing_variance,
+      notes: row.existing_notes,
+      closed_at: row.existing_closed_at
+    } : null
+    const suggestedOpeningCash = row?.suggested_opening_cash || 0
+
+    setFigures(figuresResult)
+    setExisting(existingResult)
+    setOpeningCash(String(existingResult ? existingResult.opening_cash : suggestedOpeningCash))
+    setActualCash(existingResult ? String(existingResult.actual_cash) : '')
+    setNotes(existingResult?.notes || '')
+    setPreviewLoading(false)
   }
 
   const openingNum = parseFloat(openingCash) || 0
@@ -62,19 +89,18 @@ export default function DailyClosingPage() {
   const handleSave = async (e) => {
     e.preventDefault()
     setMessage('')
-    const result = await window.ipcRenderer.invoke('save-daily-closing', {
-      date,
-      openingCash: openingNum,
-      actualCash: actualNum,
-      notes,
-      userId: user?.id
+    const { error } = await supabase.rpc('save_daily_closing', {
+      p_date: date,
+      p_opening_cash: openingNum,
+      p_actual_cash: actualNum,
+      p_notes: notes || null
     })
-    if (result.success) {
+    if (!error) {
       await loadPreview(date)
       loadHistory()
       setMessage('Closing saved')
     } else {
-      setMessage(result.message || 'Failed to save closing')
+      setMessage(error.message || 'Failed to save closing')
     }
   }
 
@@ -89,7 +115,7 @@ export default function DailyClosingPage() {
       <Sidebar />
       <div className="flex-1">
         <Navbar />
-        <div className="p-8">
+        <div className="p-4 sm:p-8">
           <h1 className="text-3xl font-bold mb-6">Daily Closing</h1>
 
           <div className="bg-white rounded-lg shadow p-6 mb-6 max-w-2xl">
@@ -114,18 +140,18 @@ export default function DailyClosingPage() {
               </span> — if this isn't the date you meant to type, use the calendar icon or the Today button instead.
             </p>
 
-            {figures && (
+            {(figures || previewLoading) && (
               <form onSubmit={handleSave}>
-                <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-sm mb-6">
-                  <div className="flex justify-between"><span className="text-gray-500">Cash Sales</span><span>₹{figures.cashSales.toFixed(2)}</span></div>
-                  <div className="flex justify-between"><span className="text-gray-500">Card Sales</span><span>₹{figures.cardSales.toFixed(2)}</span></div>
-                  <div className="flex justify-between"><span className="text-gray-500">Credit Sales (not cash)</span><span>₹{figures.creditSales.toFixed(2)}</span></div>
-                  <div className="flex justify-between"><span className="text-gray-500">Cash Payments Received</span><span>₹{figures.paymentsReceivedCash.toFixed(2)}</span></div>
-                  <div className="flex justify-between"><span className="text-gray-500">Card Payments Received</span><span>₹{figures.paymentsReceivedCard.toFixed(2)}</span></div>
-                  <div className="flex justify-between"><span className="text-gray-500">Cash Refunds Issued</span><span className="text-red-600">-₹{figures.refundsCash.toFixed(2)}</span></div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-2 text-sm mb-6">
+                  <div className="flex justify-between"><span className="text-gray-500">Cash Sales</span>{previewLoading ? <Skeleton className="h-4 w-16" /> : <span>₹{figures.cashSales.toFixed(2)}</span>}</div>
+                  <div className="flex justify-between"><span className="text-gray-500">Card Sales</span>{previewLoading ? <Skeleton className="h-4 w-16" /> : <span>₹{figures.cardSales.toFixed(2)}</span>}</div>
+                  <div className="flex justify-between"><span className="text-gray-500">Credit Sales (not cash)</span>{previewLoading ? <Skeleton className="h-4 w-16" /> : <span>₹{figures.creditSales.toFixed(2)}</span>}</div>
+                  <div className="flex justify-between"><span className="text-gray-500">Cash Payments Received</span>{previewLoading ? <Skeleton className="h-4 w-16" /> : <span>₹{figures.paymentsReceivedCash.toFixed(2)}</span>}</div>
+                  <div className="flex justify-between"><span className="text-gray-500">Card Payments Received</span>{previewLoading ? <Skeleton className="h-4 w-16" /> : <span>₹{figures.paymentsReceivedCard.toFixed(2)}</span>}</div>
+                  <div className="flex justify-between"><span className="text-gray-500">Cash Refunds Issued</span>{previewLoading ? <Skeleton className="h-4 w-16" /> : <span className="text-red-600">-₹{figures.refundsCash.toFixed(2)}</span>}</div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-4 mb-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
                   <Field label="Opening Cash">
                     <input
                       type="number" min="0" step="0.01"
@@ -147,11 +173,11 @@ export default function DailyClosingPage() {
                 <div className="bg-gray-50 rounded p-4 mb-4 space-y-1">
                   <div className="flex justify-between text-sm">
                     <span className="text-gray-600">Expected Cash in Drawer</span>
-                    <span className="font-medium">₹{expectedCash.toFixed(2)}</span>
+                    {previewLoading ? <Skeleton className="h-4 w-16" /> : <span className="font-medium">₹{expectedCash.toFixed(2)}</span>}
                   </div>
                   <div className="flex justify-between font-bold">
                     <span>Variance</span>
-                    <span className={varianceLabel(variance).className}>{varianceLabel(variance).text}</span>
+                    {previewLoading ? <Skeleton className="h-4 w-16" /> : <span className={varianceLabel(variance).className}>{varianceLabel(variance).text}</span>}
                   </div>
                 </div>
 
@@ -174,35 +200,49 @@ export default function DailyClosingPage() {
           </div>
 
           <h2 className="text-xl font-bold mb-3">Closing History</h2>
-          <div className="bg-white rounded-lg shadow overflow-hidden">
-            <table className="w-full">
-              <thead className="bg-gray-100 border-b">
-                <tr>
-                  <th className="px-6 py-3 text-left">Date</th>
-                  <th className="px-6 py-3 text-right">Expected</th>
-                  <th className="px-6 py-3 text-right">Actual</th>
-                  <th className="px-6 py-3 text-right">Variance</th>
-                  <th className="px-6 py-3 text-left">Closed By</th>
-                </tr>
-              </thead>
-              <tbody>
-                {history.map(h => {
-                  const v = varianceLabel(h.variance)
-                  return (
-                    <tr key={h.id} className="border-b hover:bg-gray-50 cursor-pointer" onClick={() => setDate(h.closing_date)}>
-                      <td className="px-6 py-3">{h.closing_date}</td>
-                      <td className="px-6 py-3 text-right">₹{h.expected_cash.toFixed(2)}</td>
-                      <td className="px-6 py-3 text-right">₹{h.actual_cash.toFixed(2)}</td>
-                      <td className={`px-6 py-3 text-right ${v.className}`}>{v.text}</td>
-                      <td className="px-6 py-3">{h.closed_by_username || '-'}</td>
-                    </tr>
-                  )
-                })}
-                {history.length === 0 && (
-                  <tr><td colSpan="5" className="px-6 py-6 text-center text-gray-400">No closings recorded yet</td></tr>
-                )}
-              </tbody>
-            </table>
+          <div className="bg-white rounded-lg shadow overflow-hidden overflow-x-auto">
+            {historyLoading ? (
+              <table className="w-full">
+                <thead className="bg-gray-100 border-b">
+                  <tr>
+                    <th className="px-6 py-3 text-left">Date</th>
+                    <th className="px-6 py-3 text-right">Expected</th>
+                    <th className="px-6 py-3 text-right">Actual</th>
+                    <th className="px-6 py-3 text-right">Variance</th>
+                    <th className="px-6 py-3 text-left">Closed By</th>
+                  </tr>
+                </thead>
+                <TableSkeleton rows={5} cols={5} />
+              </table>
+            ) : history.length === 0 ? (
+              <EmptyState title="No closings recorded yet" message="Save your first daily closing above and it will show up here." />
+            ) : (
+              <table className="w-full">
+                <thead className="bg-gray-100 border-b">
+                  <tr>
+                    <th className="px-6 py-3 text-left">Date</th>
+                    <th className="px-6 py-3 text-right">Expected</th>
+                    <th className="px-6 py-3 text-right">Actual</th>
+                    <th className="px-6 py-3 text-right">Variance</th>
+                    <th className="px-6 py-3 text-left">Closed By</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.map(h => {
+                    const v = varianceLabel(h.variance)
+                    return (
+                      <tr key={h.id} className="row-in border-b hover:bg-gray-50 cursor-pointer" onClick={() => setDate(h.closing_date)}>
+                        <td className="px-6 py-3">{h.closing_date}</td>
+                        <td className="px-6 py-3 text-right">₹{h.expected_cash.toFixed(2)}</td>
+                        <td className="px-6 py-3 text-right">₹{h.actual_cash.toFixed(2)}</td>
+                        <td className={`px-6 py-3 text-right ${v.className}`}>{v.text}</td>
+                        <td className="px-6 py-3">{h.closed_by_username || '-'}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            )}
           </div>
         </div>
       </div>

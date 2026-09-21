@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { useDispatch } from 'react-redux'
 import { setUser } from '../store/slices/auth'
+import { supabase } from '../lib/supabaseClient'
+import { getPermissionsForRole } from '../utils/permissions'
 
 export default function Login() {
   const [username, setUsername] = useState('')
@@ -11,24 +13,81 @@ export default function Login() {
 
   const handleLogin = async (e) => {
     e.preventDefault()
-    const result = await window.ipcRenderer.invoke('user-login', { username, password })
-    
-    if (result.success) {
-      dispatch(setUser({ user: result.user, permissions: result.user.permissions }))
-    } else {
-      setMessage(result.message)
+
+    const loginValue = username.trim()
+
+    if (!loginValue || !password) {
+      setMessage('Username or email and password are required.')
+      return
+    }
+
+    try {
+      let emailToUse = loginValue
+
+      if (!loginValue.includes('@')) {
+        const { data: resolvedEmail, error: usernameLookupError } = await supabase
+          .rpc('get_email_for_username', { p_username: loginValue })
+
+        if (usernameLookupError) {
+          setMessage(usernameLookupError.message)
+          return
+        }
+
+        if (!resolvedEmail) {
+          setMessage('Username not found. Try your email or create the profile row first.')
+          return
+        }
+
+        emailToUse = resolvedEmail
+      }
+
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: emailToUse,
+        password,
+      })
+
+      if (error) {
+        setMessage(error.message)
+        return
+      }
+
+      const { data: profile, error: profileError } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', data.user.id)
+        .maybeSingle()
+
+      if (profileError && profileError.code !== 'PGRST116') {
+        setMessage(profileError.message)
+        return
+      }
+
+      const role = profile?.role || 'Cashier'
+      const permissions = await getPermissionsForRole(role)
+
+      dispatch(setUser({
+        user: {
+          id: data.user.id,
+          email: data.user.email,
+          role,
+          permissions,
+        },
+        permissions,
+      }))
+    } catch (error) {
+      setMessage(error.message || 'Unable to sign in.')
     }
   }
 
   return (
     <div className="flex items-center justify-center min-h-screen bg-gray-100">
       <div className="bg-white p-8 rounded-lg shadow-md w-96">
-        <h1 className="text-3xl font-bold mb-6 text-center">Modern Fashion Bazaar</h1>
+        <h1 className="text-3xl font-bold mb-6 text-center">CRM</h1>
         <form onSubmit={handleLogin}>
-          <label className="block text-xs text-gray-500 mb-1">Username</label>
+          <label className="block text-xs text-gray-500 mb-1">Username or Email</label>
           <input
             type="text"
-            placeholder="Username"
+            placeholder="user@ex.com or username"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
             className="w-full px-4 py-2 border rounded mb-4"
